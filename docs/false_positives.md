@@ -35,6 +35,14 @@ This lint fires for every `.clone()` call on `Env`. False positives occur when:
 - The `Env` is consumed before the clone site and you genuinely need a second handle.
 - The code is generic over a trait that does not guarantee `Env`-like cheap pass-by-value semantics.
 
+### `redundant_address_clone`
+
+This lint fires for every `.clone()` call on `Address`. False positives occur when:
+
+- The `Address` is consumed before the clone site and you genuinely need a second handle.
+- The code is generic over a trait that does not guarantee `Address`-like cheap pass-by-value semantics.
+- Cloning a reference `&Address` to obtain an owned `Address` (to satisfy the borrow checker) is legitimate and is not flagged.
+
 ### `symbol_new_for_short_literal`
 
 This lint fires when `Symbol::new(&env, literal)` is called with a short literal. False positives occur when:

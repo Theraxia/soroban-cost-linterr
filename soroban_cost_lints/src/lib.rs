@@ -153,6 +153,61 @@ fn is_type_match<'tcx>(
     }
 }
 
+rustc_session::declare_lint! {
+    pub REDUNDANT_ADDRESS_CLONE,
+    Warn,
+    "redundant clone on Address object"
+}
+/// Concrete pass that fires [`REDUNDANT_ADDRESS_CLONE`].
+pub struct RedundantAddressClone;
+rustc_session::impl_lint_pass!(RedundantAddressClone => [REDUNDANT_ADDRESS_CLONE]);
+
+impl<'tcx> LateLintPass<'tcx> for RedundantAddressClone {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::MethodCall(path_segment, receiver, _args, _span) = expr.kind
+            && path_segment.ident.name.as_str() == "clone"
+        {
+            let is_addr = if let Some(adt_def) =
+                ty_adt_def(cx.typeck_results().expr_ty(receiver).peel_refs())
+            {
+                match_soroban_def_path(cx, adt_def.did(), &["soroban_sdk", "Address"])
+            } else {
+                false
+            };
+
+            if is_addr {
+                // Clone on &Address produces an owned Address from a reference — genuinely needed.
+                let receiver_ty = cx.typeck_results().expr_ty(receiver);
+                let (_inner, ref_count, _) = peel_and_count_ty_refs(receiver_ty);
+                if ref_count > 0 {
+                    return;
+                }
+            }
+
+            // If the receiver is a local binding that is still used after
+            // the clone, the original and the clone are both live — skip.
+            if let Some(local_id) = receiver.res_local_id() {
+                if local_used_after_expr(cx, local_id, expr) {
+                    return;
+                }
+            } else {
+                // Cannot statically determine whether the receiver is used
+                // after the clone — be conservative and skip.
+                return;
+            }
+
+            span_lint_and_help(
+                cx,
+                REDUNDANT_ADDRESS_CLONE,
+                expr.span,
+                "redundant clone on Address object",
+                None,
+                "pass Address by reference or move instead of cloning",
+            );
+        }
+    }
+}
+
 const SOROBAN_STORAGE_TYPES: &[&[&str]] = &[
     &["soroban_sdk", "storage", "Storage"],
     &["soroban_sdk", "storage", "Instance"],
@@ -525,6 +580,10 @@ pub const LINT_METADATA: &[LintMetadata] = &[
         category: LintCategory::Memory,
     },
     LintMetadata {
+        lint: REDUNDANT_ADDRESS_CLONE,
+        category: LintCategory::Memory,
+    },
+    LintMetadata {
         lint: UNNECESSARY_HOST_FUNCTION_CALL,
         category: LintCategory::Compute,
     },
@@ -627,6 +686,7 @@ pub fn register_lints(_sess: &rustc_session::Session, lint_store: &mut LintStore
         SOROBAN_STORAGE_IN_LOOP,
         SOROBAN_REDUNDANT_STORAGE_READ,
         REDUNDANT_ENV_CLONE,
+        REDUNDANT_ADDRESS_CLONE,
         UNNECESSARY_HOST_FUNCTION_CALL,
         UNBOUNDED_RECURSION,
         HOST_IN_LOOP,
@@ -653,6 +713,7 @@ pub fn register_lints(_sess: &rustc_session::Session, lint_store: &mut LintStore
     lint_store.register_late_pass(|_| Box::new(SorobanStorageInLoop));
     lint_store.register_late_pass(|_| Box::new(SorobanRedundantStorageRead));
     lint_store.register_late_pass(|_| Box::new(RedundantEnvClone));
+    lint_store.register_late_pass(|_| Box::new(RedundantAddressClone));
     lint_store.register_late_pass(|_| Box::new(UnnecessaryHostFunctionCall));
     lint_store.register_late_pass(|_| Box::new(UnboundedRecursion::default()));
     lint_store.register_late_pass(|_| Box::new(HostInLoop));
