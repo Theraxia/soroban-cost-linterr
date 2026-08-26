@@ -35,6 +35,13 @@
     "name": "redundant_env_clone"
   },
   {
+    "category": "Memory",
+    "default_level": "warn",
+    "description": "redundant clone on Address object",
+    "docs_path": "docs/lints/redundant_address_clone.md",
+    "name": "redundant_address_clone"
+  },
+  {
     "category": "Compute",
     "default_level": "warn",
     "description": "unnecessary host function call inside loop",
