@@ -1,3 +1,9 @@
+# `redundant_address_clone`
+
+**Default Severity:** `warn`
+
+**Target Resource:** [CPU — memory allocation, copy, and host object dispatch](../cost_rationale.md#per-lint-resource-summary)
+
 ## What it does
 
 Detects unnecessary `.clone()` calls on the Soroban `Address` object. The lint
@@ -22,6 +28,10 @@ costs.
 Every `Address::clone()` duplicates host-side handle structures, causing
 additional CPU instructions and possible memory traffic. The per-clone cost is
 small but can be significant in aggregate in hot paths.
+
+Measured guidance and benchmark references are provided in the project's
+`cost_benchmarks` crate; see `cost_benchmarks/` for microbenchmarks related to
+host-handle cloning patterns.
 
 ## How to reproduce
 
