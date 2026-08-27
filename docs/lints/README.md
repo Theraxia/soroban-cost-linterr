@@ -17,6 +17,7 @@ See the [Cost Rationale](../cost_rationale.md) page for a full explanation of So
 | [`soroban_redundant_storage_read`](soroban_redundant_storage_read.md) | `warn` | multiple sequential reads of the same storage key without modification |
 | [`storage_write_without_read`](storage_write_without_read.md) | `warn` | storage write without a corresponding read |
 | [`instance_storage_for_unbounded_data`](instance_storage_for_unbounded_data.md) | `warn` | unbounded collection written to instance storage |
+| [`unwrap_on_storage_get`](unwrap_on_storage_get.md) | `warn` | unwrap or expect directly on a storage read — panics on a missing or expired key |
 
 ## CPU/Compute
 
@@ -25,8 +26,10 @@ See the [Cost Rationale](../cost_rationale.md) page for a full explanation of So
 | [`unnecessary_host_function_call`](unnecessary_host_function_call.md) | `warn` | unnecessary host function call inside loop |
 | [`host_in_loop`](host_in_loop.md) | `warn` | use of Host object inside a loop |
 | [`contract_call_in_loop`](contract_call_in_loop.md) | `warn` | cross-contract invocation inside a loop |
+| [`token_transfer_in_loop`](token_transfer_in_loop.md) | `warn` | token transfer (transfer / transfer_from) on a contract client inside a loop |
 | [`unbounded_input_loop`](unbounded_input_loop.md) | `warn` | loop bound derived from untrusted input with storage write in body |
 | [`signature_verification_in_loop`](signature_verification_in_loop.md) | `warn` | signature verification performed inside a loop |
+| [`crypto_hash_of_constant`](crypto_hash_of_constant.md) | `warn` | cryptographic hash of a compile-time constant value |
 | [`linear_scan_in_loop`](linear_scan_in_loop.md) | `warn` | linear scan on collection inside a loop — O(n²) cost |
 | [`require_auth_in_loop`](require_auth_in_loop.md) | `warn` | Address::require_auth or require_auth_for_args called inside a loop |
 | [`formatted_panic_payload`](formatted_panic_payload.md) | `warn` | format!, formatted panic!, or expect(&format!(..)) pulls string-formatting machinery into a contract |
@@ -45,6 +48,7 @@ See the [Cost Rationale](../cost_rationale.md) page for a full explanation of So
 | [`map_insert_in_loop`](map_insert_in_loop.md) | `warn` | Map::insert called inside a loop |
 | [`storage_key_construction_in_loop`](storage_key_construction_in_loop.md) | `warn` | storage key constructed inside a loop body where it could be hoisted |
 | [`vec_where_slice_could_be_used`](vec_where_slice_could_be_used.md) | `warn` | soroban_sdk::Vec passed by value where a native Rust slice would suffice |
+| [`std_collection_in_contract`](std_collection_in_contract.md) | `warn` | std collection type used in contract code — prefer soroban_sdk::Map / soroban_sdk::Vec |
 
 ## Entry Lifecycle
 

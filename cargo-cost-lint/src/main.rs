@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-mod budget_config;
 pub mod cache;
 mod config;
 mod error;
@@ -8,13 +6,13 @@ mod lint_name_set;
 mod output_formatters;
 
 use clap::{ArgGroup, Parser, ValueEnum};
+use config::BudgetConfig;
 use output_formatters::{LintFinding, OutputFormat, Span};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
-
 #[derive(Parser, Debug)]
 #[command(name = "cargo-cost-lint")]
 #[command(version = long_version())]
@@ -104,11 +102,6 @@ struct Cli {
     /// non-empty value, output is uncoloured.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, value_name = "WHEN")]
     color: ColorChoice,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct BudgetConfig {
-    pub lints: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Colour-policy preference forwarded to the underlying `cargo dylint`
@@ -365,50 +358,138 @@ fn validate_and_build_flags(config: &BudgetConfig) -> Result<Vec<String>, String
     build_effective_lint_flags(Some(config), &[], &[], &[])
 }
 
-fn resolve_config(config: Option<&str>) -> Option<PathBuf> {
-    if let Some(path) = config {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
+/// Container for `.lintignore` suppression patterns.
+#[derive(Clone, Debug)]
+pub struct LintIgnore {
+    gitignore: ignore::gitignore::Gitignore,
+    pub path: PathBuf,
+}
+
+impl LintIgnore {
+    /// Discovers `.lintignore` by searching `cwd` and walking up to `workspace_root`.
+    #[allow(clippy::collapsible_if)]
+    pub fn discover(cwd: &Path, workspace_root: &Path) -> Option<Self> {
+        let mut current = cwd.to_path_buf();
+        loop {
+            let path = current.join(".lintignore");
+            if path.exists() {
+                let mut builder = ignore::gitignore::GitignoreBuilder::new(&current);
+                if builder.add(&path).is_none() {
+                    let build_res = builder.build();
+                    if let Ok(gitignore) = build_res {
+                        return Some(LintIgnore { gitignore, path });
+                    }
+                }
+            }
+            if current == workspace_root {
+                break;
+            }
+            match current.parent() {
+                Some(parent) => current = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        None
+    }
+
+    /// Checks if a file path matches any `.lintignore` rule.
+    pub fn is_ignored<P: AsRef<Path>>(&self, file_path: P) -> bool {
+        let path = file_path.as_ref();
+        let rel_path = if let Ok(current) = std::env::current_dir() {
+            if let Ok(stripped) = path.strip_prefix(&current) {
+                stripped
+            } else {
+                path
+            }
+        } else {
+            path
+        };
+        self.gitignore.matched(rel_path, false).is_ignore()
+            || self.gitignore.matched(path, false).is_ignore()
+    }
+}
+
+/// Helper to find workspace root directory by invoking `cargo metadata` or walking up parent directories.
+#[allow(clippy::collapsible_if)]
+pub fn find_workspace_root_path(start_dir: &Path) -> PathBuf {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["metadata", "--no-deps", "--format-version", "1"]);
+    cmd.current_dir(start_dir);
+    if let Ok(output) = cmd.output() {
+        if output.status.success() {
+            let json_res = serde_json::from_slice::<serde_json::Value>(&output.stdout);
+            if let Ok(val) = json_res {
+                if let Some(root_str) = val.get("workspace_root").and_then(|v| v.as_str()) {
+                    return PathBuf::from(root_str);
+                }
+            }
         }
     }
-    let budget = PathBuf::from("budget.toml");
-    if budget.exists() {
-        return Some(budget);
+    let mut current = start_dir.to_path_buf();
+    let mut candidate = current.clone();
+    loop {
+        let manifest = current.join("Cargo.toml");
+        if manifest.exists() {
+            candidate = current.clone();
+            let read_res = fs::read_to_string(&manifest);
+            if let Ok(content) = read_res {
+                if content.contains("[workspace]") {
+                    return current;
+                }
+            }
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    candidate
+}
+
+/// Discovers `budget.toml` by searching `cwd` and walking up to `workspace_root`.
+pub fn discover_config_file(cwd: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        let budget = current.join("budget.toml");
+        if budget.exists() {
+            return Some(budget);
+        }
+        if current == workspace_root {
+            break;
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
+        }
     }
     None
+}
+
+/// Resolves config path based on CLI `--config` option or by walking up from `cwd` to `workspace_root`.
+/// An explicit `--config <PATH>` wins and errors if the specified file does not exist.
+pub fn resolve_config(config_arg: Option<&str>) -> Result<Option<PathBuf>, String> {
+    if let Some(path_str) = config_arg {
+        let path = PathBuf::from(path_str);
+        if path.exists() {
+            Ok(Some(path))
+        } else {
+            Err(format!("Error: Config file '{}' does not exist", path_str))
+        }
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("Error: Failed to get current directory: {}", e))?;
+        let workspace_root = find_workspace_root_path(&cwd);
+        Ok(discover_config_file(&cwd, &workspace_root))
+    }
 }
 
 /// Loads `path` as a validated `BudgetConfig` and formats its `[lints]`
 /// entries into `-A`/`-W`/`-D` flags for `DYLINT_RUSTFLAGS`. Validation
 /// (unknown lint names, invalid levels) is handled by
 /// `BudgetConfig::from_file_validated`, the single canonical config parser.
-// Not currently reached from `main()`, which still uses the inline
-// `validate_and_build_flags` path. `cargo-cost-lint` now carries two config
-// generations -- this one via `BudgetConfig::from_file_validated` (validates
-// lint names and levels) and the newer `config::Config::from_file_or_default`
-// (fallback defaults, no name validation). Both are tested; picking which one
-// ships is a behavioural decision for a maintainer, so this change leaves
-// `main()` as it found it rather than choosing silently.
-// Kept: scaffolding for future feature implementations
-#[allow(dead_code)]
-fn parse_budget_config(path: &str) -> Result<Vec<String>, String> {
-    let config = config::BudgetConfig::from_file_validated(Path::new(path), LINT_NAMES)?;
-
-    let mut lint_flags = Vec::new();
-    if let Some(lints) = config.lints {
-        for (lint, level) in lints {
-            let flag = match level.as_str() {
-                "allow" => "-A",
-                "warn" => "-W",
-                "deny" => "-D",
-                _ => unreachable!("level already validated by BudgetConfig::from_file_validated"),
-            };
-            lint_flags.push(format!("{} {}", flag, lint));
-        }
-    }
-
-    Ok(lint_flags)
+pub fn parse_budget_config(path: &str) -> Result<Vec<String>, String> {
+    let config = BudgetConfig::from_file_validated(Path::new(path), LINT_NAMES)?;
+    Ok(config.to_lint_flags())
 }
 
 /// Lenient wrapper around [`parse_budget_config`] that uses safe defaults
@@ -423,9 +504,7 @@ fn parse_budget_config(path: &str) -> Result<Vec<String>, String> {
 /// actually wrote something wrong — are returned unchanged so the
 /// strict behaviour already covered by [`parse_budget_config`] and
 /// its existing tests is preserved.
-// Kept: scaffolding for future feature implementations
-#[allow(dead_code)]
-fn try_parse_budget_config(path: &str) -> Result<Vec<String>, String> {
+pub fn try_parse_budget_config(path: &str) -> Result<Vec<String>, String> {
     match parse_budget_config(path) {
         Ok(flags) => Ok(flags),
         Err(e)
@@ -434,6 +513,23 @@ fn try_parse_budget_config(path: &str) -> Result<Vec<String>, String> {
         {
             eprintln!("warning: {e}\n         continuing with safe defaults (no lint overrides).");
             Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Loads and validates `budget.toml` from `path` into `BudgetConfig` using safe defaults
+/// (returning `Ok(None)`) when the file cannot be read or parsed, but propagating
+/// validation errors.
+pub fn load_budget_config_lenient(path: &Path) -> Result<Option<BudgetConfig>, String> {
+    match BudgetConfig::from_file_validated(path, LINT_NAMES) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(e)
+            if e.starts_with("Error: Failed to read")
+                || e.starts_with("Error: Failed to parse") =>
+        {
+            eprintln!("warning: {e}\n         continuing with safe defaults (no lint overrides).");
+            Ok(None)
         }
         Err(e) => Err(e),
     }
@@ -498,22 +594,38 @@ fn main() {
     let mut resolved_config_path: Option<PathBuf> = None;
     let mut config_opt: Option<BudgetConfig> = None;
 
-    if let Some(ref path) = resolve_config(cli.config.as_deref()) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let workspace_root = find_workspace_root_path(&cwd);
+    let lintignore_opt = LintIgnore::discover(&cwd, &workspace_root);
+
+    let resolved_config = match resolve_config(cli.config.as_deref()) {
+        Ok(path_opt) => path_opt,
+        Err(e) => {
+            eprintln!("{}", e);
+            exit(1);
+        }
+    };
+
+    if let Some(ref path) = resolved_config {
         resolved_config_path = Some(path.clone());
-        if !quiet {
+        if verbose {
+            eprintln!("Using config file: {}", path.display());
+        } else if !quiet {
             eprintln!("Using config: {}", path.display());
         }
-        if let Ok(config_str) = fs::read_to_string(path) {
-            if let Ok(config) = toml::from_str::<BudgetConfig>(&config_str) {
-                config_opt = Some(config);
-            } else {
-                if !quiet {
-                    eprintln!("Warning: Failed to parse {}", path.display());
-                }
+        match load_budget_config_lenient(path) {
+            Ok(cfg) => {
+                config_opt = cfg;
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                exit(1);
             }
         }
     } else {
-        if !quiet && cli.allow.is_empty() && cli.warn.is_empty() && cli.deny.is_empty() {
+        if verbose {
+            eprintln!("No budget.toml found, using default lint levels.");
+        } else if !quiet && cli.allow.is_empty() && cli.warn.is_empty() && cli.deny.is_empty() {
             eprintln!("Warning: budget.toml not found, using default lint levels.");
         }
     }
@@ -615,7 +727,8 @@ fn main() {
     let mut cargo_args = Vec::new();
     cargo_args.extend(package_args);
 
-    if cli.format != OutputFormat::Text {
+    let has_lintignore = lintignore_opt.is_some();
+    if cli.format != OutputFormat::Text || has_lintignore {
         cargo_args.push("--message-format=json".to_string());
     }
 
@@ -632,6 +745,9 @@ fn main() {
         } else {
             eprintln!("[verbose] config: (none — using default lint levels)");
         }
+        if let Some(ref li) = lintignore_opt {
+            eprintln!("[verbose] .lintignore: {}", li.path.display());
+        }
         if !rustflags_value.is_empty() {
             eprintln!("[verbose] DYLINT_RUSTFLAGS: {}", rustflags_value);
         } else {
@@ -640,7 +756,7 @@ fn main() {
         eprintln!("[verbose] command: {:?}", cmd);
     }
 
-    if cli.format != OutputFormat::Text {
+    if cli.format != OutputFormat::Text || has_lintignore {
         cmd.stdout(Stdio::piped());
         let mut child = cmd
             .spawn()
@@ -659,18 +775,6 @@ fn main() {
                         if let Some(code) = message.get("code") {
                             if let Some(lint_name) = code.get("code").and_then(|c| c.as_str()) {
                                 if LINT_NAMES.contains(&lint_name) {
-                                    let level = message
-                                        .get("level")
-                                        .and_then(|l| l.as_str())
-                                        .unwrap_or("unknown");
-                                    if level == "error" || level == "deny" {
-                                        highest_exit_code = 1;
-                                    }
-
-                                    let msg_text = message
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("");
                                     let mut file = String::new();
                                     let mut span_obj = Span {
                                         line_start: 0,
@@ -717,6 +821,31 @@ fn main() {
                                         }
                                     }
 
+                                    if let Some(ref lintignore) = lintignore_opt {
+                                        if !file.is_empty() && lintignore.is_ignored(&file) {
+                                            if verbose {
+                                                eprintln!(
+                                                    "[verbose] Suppressing finding in {} due to .lintignore pattern",
+                                                    file
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                    }
+
+                                    let level = message
+                                        .get("level")
+                                        .and_then(|l| l.as_str())
+                                        .unwrap_or("unknown");
+                                    if level == "error" || level == "deny" {
+                                        highest_exit_code = 1;
+                                    }
+
+                                    let msg_text = message
+                                        .get("message")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("");
+
                                     let mut help_text = None;
                                     if let Some(children) =
                                         message.get("children").and_then(|c| c.as_array())
@@ -745,6 +874,14 @@ fn main() {
                                     };
 
                                     match cli.format {
+                                        OutputFormat::Text => {
+                                            if let Some(rendered) =
+                                                message.get("rendered").and_then(|r| r.as_str())
+                                            {
+                                                eprint!("{}", rendered);
+                                                recorded_stdout.push_str(rendered);
+                                            }
+                                        }
                                         OutputFormat::Json => {
                                             if let Ok(json_str) = serde_json::to_string(&finding) {
                                                 println!("{}", json_str);
@@ -767,7 +904,6 @@ fn main() {
                                         OutputFormat::Sarif => {
                                             sarif_findings.push(finding);
                                         }
-                                        OutputFormat::Text => {}
                                     }
                                 }
                             }
@@ -924,6 +1060,87 @@ mod tests {
 
         assert_eq!(registered_names, inventory_names);
         assert_eq!(LINT_INVENTORY.version, "1.0");
+    }
+
+    #[test]
+    fn lint_info_matches_lint_inventory() {
+        assert_eq!(
+            LINT_INFO.len(),
+            LINT_INVENTORY.lints.len(),
+            "LINT_INFO and LINT_INVENTORY must have identical number of entries"
+        );
+        for (info, inv) in LINT_INFO.iter().zip(LINT_INVENTORY.lints.iter()) {
+            assert_eq!(info.name, inv.name, "Lint names must match");
+            assert_eq!(
+                info.level, inv.default_level,
+                "Lint default levels must match for {}",
+                info.name
+            );
+            assert_eq!(
+                info.description, inv.description,
+                "Lint descriptions must match for {}",
+                info.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_declare_lint_parser_with_comma_in_description() {
+        let sample = r#"
+        rustc_session::declare_lint! {
+            pub TEST_COMMA_LINT,
+            Warn,
+            "this description has, multiple, commas, and formatting"
+        }
+        "#;
+        let mut depth: u32 = 0;
+        let mut end_offset = 0;
+        let start = sample.find("declare_lint! {").unwrap();
+        let after_start = &sample[start + "declare_lint! {".len()..];
+        depth += 1;
+        for (i, ch) in after_start.char_indices() {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end_offset = i;
+                    break;
+                }
+            }
+        }
+        assert!(end_offset > 0);
+        let block = &after_start[..end_offset];
+        let lines: Vec<&str> = block
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+            .collect();
+        assert!(lines.len() >= 3);
+        let name = lines[0]
+            .strip_prefix("pub ")
+            .unwrap_or(lines[0])
+            .trim_end_matches(',')
+            .trim()
+            .to_lowercase();
+        let level = lines[1].trim_end_matches(',').trim().to_lowercase();
+        let raw_desc = lines[2..].join(" ");
+        let trimmed_desc = raw_desc.trim().trim_end_matches(',').trim();
+        let description = if trimmed_desc.starts_with('"')
+            && trimmed_desc.ends_with('"')
+            && trimmed_desc.len() >= 2
+        {
+            trimmed_desc[1..trimmed_desc.len() - 1].to_string()
+        } else {
+            trimmed_desc.trim_matches('"').to_string()
+        };
+
+        assert_eq!(name, "test_comma_lint");
+        assert_eq!(level, "warn");
+        assert_eq!(
+            description,
+            "this description has, multiple, commas, and formatting"
+        );
     }
 
     #[test]
@@ -1249,6 +1466,54 @@ mod tests {
         let result = try_parse_budget_config(&path.to_string_lossy());
         assert!(result.is_err(), "expected Err for unknown level");
         assert!(result.unwrap_err().contains("Unknown lint level"));
+    }
+
+    #[test]
+    fn load_budget_config_lenient_handles_valid_missing_and_invalid() {
+        let dir = std::env::temp_dir().join("cost_lint_test_load_lenient");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Missing file -> Ok(None)
+        let missing = dir.join("missing_budget.toml");
+        let res_missing = load_budget_config_lenient(&missing);
+        assert!(res_missing.is_ok());
+        assert_eq!(res_missing.unwrap(), None);
+
+        // 2. Unparseable file -> Ok(None)
+        let invalid = dir.join("invalid_budget.toml");
+        fs::write(&invalid, "invalid toml {{{{").unwrap();
+        let res_invalid = load_budget_config_lenient(&invalid);
+        assert!(res_invalid.is_ok());
+        assert_eq!(res_invalid.unwrap(), None);
+
+        // 3. Valid file -> Ok(Some(BudgetConfig))
+        let valid = dir.join("valid_budget.toml");
+        fs::write(
+            &valid,
+            "[lints]\nsoroban_storage_in_loop = \"deny\"\n",
+        )
+        .unwrap();
+        let res_valid = load_budget_config_lenient(&valid);
+        assert!(res_valid.is_ok());
+        let cfg = res_valid.unwrap().expect("should parse config");
+        assert_eq!(
+            cfg.lints
+                .as_ref()
+                .unwrap()
+                .get("soroban_storage_in_loop")
+                .map(|s| s.as_str()),
+            Some("deny")
+        );
+
+        // 4. Unknown lint level -> Err(...)
+        let bad_level = dir.join("bad_level_budget.toml");
+        fs::write(&bad_level, "[lints]\nsoroban_storage_in_loop = \"oops\"\n").unwrap();
+        let res_bad = load_budget_config_lenient(&bad_level);
+        assert!(res_bad.is_err());
+        assert!(res_bad.unwrap_err().contains("Unknown lint level"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // --- CLI argument parser unit tests (issue #320) ---
@@ -1648,8 +1913,11 @@ mod tests {
         assert_eq!(cli.color, ColorChoice::Never);
     }
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_color_explicit_always_overrides_no_color() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("NO_COLOR", "1") };
         let resolved = resolve_color_choice(&ColorChoice::Always);
         assert_eq!(resolved, ColorChoice::Always);
@@ -1658,6 +1926,7 @@ mod tests {
 
     #[test]
     fn resolve_color_explicit_never_overrides_no_color() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("NO_COLOR", "1") };
         let resolved = resolve_color_choice(&ColorChoice::Never);
         assert_eq!(resolved, ColorChoice::Never);
@@ -1666,6 +1935,7 @@ mod tests {
 
     #[test]
     fn resolve_color_auto_no_color_set_resolves_to_never() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("NO_COLOR", "1") };
         let resolved = resolve_color_choice(&ColorChoice::Auto);
         assert_eq!(resolved, ColorChoice::Never);
@@ -1674,6 +1944,7 @@ mod tests {
 
     #[test]
     fn resolve_color_auto_no_color_empty_resolves_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("NO_COLOR", "") };
         let resolved = resolve_color_choice(&ColorChoice::Auto);
         assert_eq!(resolved, ColorChoice::Auto);
@@ -1710,5 +1981,91 @@ mod tests {
     #[test]
     fn color_choice_as_cargo_arg_never_returns_never() {
         assert_eq!(ColorChoice::Never.as_cargo_arg(), Some("never"));
+    }
+
+    #[test]
+    fn test_discover_config_in_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path();
+        let budget_path = cwd.join("budget.toml");
+        std::fs::write(&budget_path, "[lints]\n").unwrap();
+
+        let found = discover_config_file(cwd, cwd);
+        assert_eq!(found, Some(budget_path));
+    }
+
+    #[test]
+    fn test_discover_config_in_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path();
+        let member_dir = workspace_root.join("member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+
+        let budget_path = workspace_root.join("budget.toml");
+        std::fs::write(&budget_path, "[lints]\n").unwrap();
+
+        let found = discover_config_file(&member_dir, workspace_root);
+        assert_eq!(found, Some(budget_path));
+    }
+
+    #[test]
+    fn test_discover_config_none_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path();
+        let member_dir = workspace_root.join("member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+
+        let found = discover_config_file(&member_dir, workspace_root);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_discover_config_stops_at_workspace_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_dir = temp.path();
+        let workspace_root = parent_dir.join("workspace");
+        let member_dir = workspace_root.join("member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+
+        // Create budget.toml in parent_dir (OUTSIDE workspace)
+        std::fs::write(parent_dir.join("budget.toml"), "[lints]\n").unwrap();
+
+        let found = discover_config_file(&member_dir, &workspace_root);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_resolve_config_explicit_override_and_missing_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid_config = temp.path().join("my_budget.toml");
+        std::fs::write(&valid_config, "[lints]\n").unwrap();
+
+        let res_ok = resolve_config(valid_config.to_str());
+        assert!(res_ok.is_ok());
+        assert_eq!(res_ok.unwrap(), Some(valid_config));
+
+        let res_err = resolve_config(Some("/nonexistent/file/path/budget.toml"));
+        assert!(res_err.is_err());
+        assert!(res_err.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_lintignore_matching() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let lintignore_path = root.join(".lintignore");
+        std::fs::write(
+            &lintignore_path,
+            "src/generated/*.rs\nsrc/legacy_batch.rs\n*.tmp.rs\n",
+        )
+        .unwrap();
+
+        let lintignore = LintIgnore::discover(root, root).expect(".lintignore should be loaded");
+        assert!(lintignore.is_ignored(root.join("src/generated/foo.rs")));
+        assert!(lintignore.is_ignored(root.join("src/legacy_batch.rs")));
+        assert!(lintignore.is_ignored(root.join("test.tmp.rs")));
+
+        assert!(!lintignore.is_ignored(root.join("src/main.rs")));
+        assert!(!lintignore.is_ignored(root.join("src/lib.rs")));
     }
 }
