@@ -25,7 +25,7 @@ Writing `env.storage().instance().set()` inside a `for` loop is mathematically g
 
 ## Features
 
-The linter hooks into the Rust compiler's AST to catch specific Soroban anti-patterns. Thirteen lints ship in `v0.1.1`:
+The linter hooks into the Rust compiler's AST to catch specific Soroban anti-patterns. Thirty lints ship in `v0.1.1`:
 
 *   **[`soroban_storage_in_loop`](docs/lints/soroban_storage_in_loop.md):** Flags storage read/write operations placed inside loop bodies, suggesting memory aggregation instead.
 *   **[`redundant_env_clone`](docs/lints/redundant_env_clone.md):** Detects unnecessary `.clone()` calls on the Soroban `Env` object.
@@ -34,13 +34,15 @@ The linter hooks into the Rust compiler's AST to catch specific Soroban anti-pat
 *   **[`inefficient_bytes_concat`](docs/lints/inefficient_bytes_concat.md):** Detects repeated `Bytes` concatenation inside loops using `+`, which creates unnecessary per-iteration allocations.
 *   **[`map_insert_in_loop`](docs/lints/map_insert_in_loop.md):** Flags `Map::insert` calls inside loop bodies.
 *   **[`symbol_new_for_short_literal`](docs/lints/symbol_new_for_short_literal.md):** Flags `Symbol::new` calls with short literal arguments that could use `symbol_short!()`.
-*   **[`bytes_append_in_loop`](docs/lints/bytes_append_in_loop.md):** Flags repeatedly growing SDK containers (`Bytes::append`, `Vec::push_back`, `Map::insert`) inside loops, suggesting native accumulation first.
+ *   **[`bytes_append_in_loop`](docs/lints/bytes_append_in_loop.md):** Flags repeatedly growing SDK containers (`Bytes::append`, `Vec::push_back`, `Map::insert`) inside loops, suggesting native accumulation first.
+ *   **[`string_concat_in_loop`](docs/lints/string_concat_in_loop.md):** Flags `String::append`/`String + String` on a `soroban_sdk::String` inside loops, since each concatenation reallocates and copies the whole accumulated string (O(n²)).
 *   **[`signature_verification_in_loop`](docs/lints/signature_verification_in_loop.md):** Flags `env.crypto().ed25519_verify`/`secp256k1_recover`/`secp256r1_verify` calls made inside loop bodies, suggesting batch/aggregate verification instead.
 *   **[`crypto_hash_of_constant`](docs/lints/crypto_hash_of_constant.md):** Flags `env.crypto().sha256`/`keccak256` calls whose input is a literal or `const` item, since re-hashing a compile-time constant at runtime is pure wasted host cost — precompute and embed the digest instead.
 *   **[`vec_where_slice_could_be_used`](docs/lints/vec_where_slice_could_be_used.md):** Flags `soroban_sdk::Vec` passed by value where a native Rust `&[T]` slice would be sufficient for read-only access.
 *   **[`extend_ttl_in_loop`](docs/lints/extend_ttl_in_loop.md):** Flags `extend_ttl` calls on instance/persistent/temporary storage made inside loop bodies, suggesting batching the TTL extension instead of refreshing per-entry per-iteration.
 *   **[`instance_storage_for_unbounded_data`](docs/lints/instance_storage_for_unbounded_data.md):** Flags `env.storage().instance().set(...)` calls where the value is an unbounded `Vec`/`Map`/`Bytes`, since instance storage is re-read and rewritten in full on every contract invocation.
 *   **[`formatted_panic_payload`](docs/lints/formatted_panic_payload.md):** Flags `format!`, a formatted `panic!`, or `.expect(&format!(..))`, all of which pull `core::fmt` into the contract in place of a cheap `panic_with_error!` + `#[contracterror]`.
+*   **[`val_conversion_chain`](docs/lints/val_conversion_chain.md):** Flags a chain of three or more `soroban_sdk` conversions (`into_val`/`try_into_val`/`from_val`/`try_from_val`) that bounce the same local value through `Val` across a `let` sequence, where converting directly to the needed shape would cost a single host call.
 
 ## How it Fits into Tollcraft
 
