@@ -5,10 +5,11 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
 
-use rustc_hir::{Expr, ExprKind, BinOpKind, UnOp, QPath};
+use rustc_hir::{Crate, Expr, ExprKind, BinOpKind, UnOp, QPath};
 use rustc_lint::{LateContext, LateLintPass, LintContext, LintPass};
 use rustc_middle::ty::{self, Ty};
 use rustc_span::Span;
+use std::collections::HashSet;
 
 rustc_lint::declare_lint! {
     pub SOROBAN_STORAGE_IN_LOOP,
@@ -38,6 +39,12 @@ rustc_lint::declare_lint! {
     pub STORAGE_WRITE_WITHOUT_READ,
     Warn,
     "performs a storage set without any prior get or has in the function"
+}
+
+rustc_lint::declare_lint! {
+    pub STORAGE_READ_NEVER_WRITTEN,
+    Warn,
+    "reads a storage key that is never written anywhere in this crate"
 }
 
 rustc_lint::declare_lint! {
@@ -250,6 +257,12 @@ pub const LINT_METADATA: &[LintMeta] = &[
         category: LintCategory::Storage,
         description: "Performs a storage set without any prior get or has in the function",
         rationale: "Blind writes can overwrite state accidentally and lack update guards.",
+    },
+    LintMeta {
+        name: "storage_read_never_written",
+        category: LintCategory::Storage,
+        description: "Reads a storage key that is never written anywhere in this crate",
+        rationale: "A read that always misses still costs a full metered storage access on every invocation. The key may be written by another contract (cross-contract state sharing), constructed dynamically, or be a typo that silently split one logical entry into two.",
     },
     LintMeta {
         name: "instance_storage_for_unbounded_data",
@@ -514,12 +527,14 @@ fn is_provably_within_64_bits<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tc
 
 #[no_mangle আনন্দের]
 pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint::LintStore) {
+    lint_store.register_late_pass(move |_| Box::new(StorageReadNeverWritten::new()));
     lint_store.register_lints(&[
         SOROBAN_STORAGE_IN_LOOP,
         REDUNDANT_ENV_CLONE,
         UNNECESSARY_HOST_FUNCTION_CALL,
         SOROBAN_REDUNDANT_STORAGE_READ,
         STORAGE_WRITE_WITHOUT_READ,
+        STORAGE_READ_NEVER_WRITTEN,
         INSTANCE_STORAGE_FOR_UNBOUNDED_DATA,
         PERSISTENT_READ_WITHOUT_TTL_EXTENSION,
         LOOP_INVARIANT_STORAGE_ACCESS,
@@ -555,6 +570,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
             UNNECESSARY_HOST_FUNCTION_CALL,
             SOROBAN_REDUNDANT_STORAGE_READ,
             STORAGE_WRITE_WITHOUT_READ,
+            STORAGE_READ_NEVER_WRITTEN,
             INSTANCE_STORAGE_FOR_UNBOUNDED_DATA,
             PERSISTENT_READ_WITHOUT_TTL_EXTENSION,
             LOOP_INVARIANT_STORAGE_ACCESS,
@@ -629,6 +645,184 @@ impl<'tcx> LateLintPass<'tcx> for CollectionLenInLoopCondition {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// =======================================================================
+// storage_read_never_written - Lint
+// =======================================================================
+//
+// Crate-wide accumulation with end-of-crate reporting. Every other pass in this
+// crate reports from within a single body; this pass instead gathers every
+// statically-known storage read key and every statically-known storage write
+// key across the whole crate, then reports (at `check_crate_post`) each read
+// whose key is written nowhere in the crate.
+//
+// The accumulator is intentionally self-contained here: it must NOT be factored
+// into shared infrastructure, because a sibling backlog lint will need the same
+// crate-wide shape and two issues editing a shared helper is exactly the
+// collision the backlog is structured to avoid.
+//
+// Dynamic keys (whose value cannot be determined statically) are skipped on
+// both the read and write sides. Skipping them on the read side means they
+// never fire; skipping them on the write side means a dynamic write never
+// suppresses a finding about an unrelated static key.
+
+#[derive(Clone, Copy)]
+enum StorageKeySpace {
+    Instance,
+    Persistent,
+    Temporary,
+}
+
+impl StorageKeySpace {
+    fn as_str(self) -> &'static str {
+        match self {
+            StorageKeySpace::Instance => "instance",
+            StorageKeySpace::Persistent => "persistent",
+            StorageKeySpace::Temporary => "temporary",
+        }
+    }
+}
+
+enum StorageAccessOp {
+    Read,
+    Write,
+}
+
+/// Decompose a terminal storage method call (`get`/`has`/`set`) into its
+/// operation, the storage key space, and the key argument expression.
+///
+/// We match the chain structurally (`storage()` -> `instance|persistent|temporary`
+/// -> `get|has|set`) rather than by resolved `DefId`, so the lint also fires
+/// against the hand-written `soroban_sdk` mocks used in UI fixtures.
+fn analyze_storage_call<'tcx>(
+    expr: &'tcx Expr<'tcx>,
+) -> Option<(StorageAccessOp, StorageKeySpace, &'tcx Expr<'tcx>)> {
+    let ExprKind::MethodCall(seg, recv, args, _) = expr.kind else {
+        return None;
+    };
+    let op = match seg.ident.name.as_str() {
+        "get" | "has" => StorageAccessOp::Read,
+        "set" => StorageAccessOp::Write,
+        _ => return None,
+    };
+    // recv: instance()/persistent()/temporary()
+    let ExprKind::MethodCall(kind_seg, kind_recv, _, _) = recv.kind else {
+        return None;
+    };
+    let space = match kind_seg.ident.name.as_str() {
+        "instance" => StorageKeySpace::Instance,
+        "persistent" => StorageKeySpace::Persistent,
+        "temporary" => StorageKeySpace::Temporary,
+        _ => return None,
+    };
+    // kind_recv: storage()
+    let ExprKind::MethodCall(storage_seg, _, _, _) = kind_recv.kind else {
+        return None;
+    };
+    if storage_seg.ident.name.as_str() != "storage" {
+        return None;
+    }
+    let key_expr = args.first()?;
+    Some((op, space, key_expr))
+}
+
+/// Reduce a key expression to a stable string when its value is statically
+/// known. Returns `None` for dynamic keys (parameters, computed values, ...).
+fn canonical_key<'tcx>(_cx: &LateContext<'tcx>, key_expr: &'tcx Expr<'tcx>) -> Option<String> {
+    // Strip the leading `&` that storage APIs require (`get(&key)`).
+    let value = match key_expr.kind {
+        ExprKind::AddrOf(_, _, inner) => inner,
+        _ => key_expr,
+    };
+    match value.kind {
+        ExprKind::Lit(lit) => match lit.node {
+            rustc_ast::ast::LitKind::Int(val, _) => Some(format!("int:{}", val.get())),
+            rustc_ast::ast::LitKind::Str(s, _) => Some(format!("str:{}", s.as_str())),
+            _ => None,
+        },
+        ExprKind::Call(path, call_args) => {
+            let ExprKind::Path(qpath) = &path.kind else {
+                return None;
+            };
+            let QPath::Resolved(_, path_segments) = qpath else {
+                return None;
+            };
+            let last = path_segments.last()?;
+            match last.ident.name.as_str() {
+                "symbol_short" => {
+                    let lit = call_args.first()?;
+                    let ExprKind::Lit(l) = lit.kind else {
+                        return None;
+                    };
+                    let rustc_ast::ast::LitKind::Str(s, _) = l.node else {
+                        return None;
+                    };
+                    Some(format!("symbol:short:{}", s.as_str()))
+                }
+                "new" => {
+                    // Symbol::new(env, "literal") — take the first string literal arg.
+                    let lit = call_args.iter().find_map(|a| match a.kind {
+                        ExprKind::Lit(l) if matches!(l.node, rustc_ast::ast::LitKind::Str(..)) => {
+                            Some(l)
+                        }
+                        _ => None,
+                    })?;
+                    let rustc_ast::ast::LitKind::Str(s, _) = lit.node else {
+                        return None;
+                    };
+                    Some(format!("symbol:{}", s.as_str()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub struct StorageReadNeverWritten {
+    reads: Vec<(Span, String)>,
+    writes: HashSet<String>,
+}
+
+impl StorageReadNeverWritten {
+    fn new() -> Self {
+        StorageReadNeverWritten {
+            reads: Vec::new(),
+            writes: HashSet::new(),
+        }
+    }
+}
+
+impl<'tcx> LateLintPass<'tcx> for StorageReadNeverWritten {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
+        if let Some((op, space, key_expr)) = analyze_storage_call(expr) {
+            if let Some(ckey) = canonical_key(cx, key_expr) {
+                let full = format!("{}:{}", space.as_str(), ckey);
+                match op {
+                    StorageAccessOp::Read => self.reads.push((expr.span, full)),
+                    StorageAccessOp::Write => {
+                        self.writes.insert(full);
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_crate_post(&mut self, cx: &LateContext<'tcx>, _krate: &'tcx Crate<'tcx>) {
+        for (span, key) in &self.reads {
+            if !self.writes.contains(key) {
+                clippy_utils::diagnostics::span_lint_and_help(
+                    cx,
+                    STORAGE_READ_NEVER_WRITTEN,
+                    *span,
+                    "storage key is read but never written anywhere in this crate",
+                    None,
+                    "Heuristic warning: the write may live in another contract (cross-contract state sharing is common and valid), or the key may be constructed dynamically. This is not proof of a bug \u{2014} confirm the key is initialised where expected before changing the code.",
+                );
             }
         }
     }
